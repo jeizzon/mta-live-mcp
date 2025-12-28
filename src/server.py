@@ -6,12 +6,11 @@ Provides real-time transit data for NYC Subway, Buses, LIRR, and Metro-North.
 
 import asyncio
 import os
-import threading
 
 from fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 from auth import extract_bearer_token, get_auth_token, validate_token
 from mta_feeds import (
@@ -35,9 +34,6 @@ from mta_feeds import (
 from station_data import station_data
 
 mcp = FastMCP("MTA Live Data")
-
-# Flag to track if station data is being loaded
-_loading_started = False
 
 
 # ============================================================================
@@ -414,42 +410,6 @@ async def get_server_info() -> dict:
 
 
 # ============================================================================
-# Background Station Data Loading
-# ============================================================================
-
-
-async def load_station_data_background():
-    """Load station data in the background."""
-    global _loading_started
-    if _loading_started:
-        return
-    _loading_started = True
-
-    print("Loading station data from MTA in background...")
-    try:
-        await station_data.load()
-        print(f"Loaded {len(station_data.subway.stations)} subway stations")
-        print(f"Loaded {len(station_data.lirr.stations)} LIRR stations")
-        print(f"Loaded {len(station_data.metro_north.stations)} Metro-North stations")
-    except Exception as e:
-        print(f"Warning: Failed to load station data: {e}")
-        print("Station lookup features will be unavailable.")
-
-
-def start_background_loading():
-    """Start loading station data in a background thread."""
-
-    def run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(load_station_data_background())
-        loop.close()
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-
-
-# ============================================================================
 # Custom HTTP Routes
 # ============================================================================
 
@@ -491,6 +451,44 @@ async def refresh_stations(request):
 
 
 # ============================================================================
+# Combined Lifespan for Station Data Loading
+# ============================================================================
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def combined_lifespan(app):
+    """Combined lifespan that loads station data and initializes MCP."""
+
+    # Start loading station data in background
+    async def load_stations():
+        print("Loading station data from MTA in background...")
+        try:
+            await station_data.load()
+            print(f"Loaded {len(station_data.subway.stations)} subway stations")
+            print(f"Loaded {len(station_data.lirr.stations)} LIRR stations")
+            print(
+                f"Loaded {len(station_data.metro_north.stations)} Metro-North stations"
+            )
+        except Exception as e:
+            print(f"Warning: Failed to load station data: {e}")
+
+    # Start station loading as a background task
+    load_task = asyncio.create_task(load_stations())
+
+    # Get the MCP app's lifespan
+    mcp_app = mcp.http_app(path="/mcp")
+
+    async with mcp_app.lifespan(app):
+        yield
+
+    # Clean up
+    if not load_task.done():
+        load_task.cancel()
+
+
+# ============================================================================
 # Server Startup
 # ============================================================================
 
@@ -508,24 +506,36 @@ if __name__ == "__main__":
     if not os.environ.get("MTA_BUS_API_KEY"):
         print("Note: MTA_BUS_API_KEY not set. Bus tools will not be available.")
 
-    # Start loading station data in background
-    start_background_loading()
-
     print(f"Starting MTA Live Data MCP server on {host}:{port}")
 
-    # Create a combined app with health check and MCP
-    from starlette.routing import Mount
-
-    # Get the MCP ASGI app
+    # Get the MCP HTTP app
     mcp_app = mcp.http_app(path="/mcp")
 
-    # Create main app with routes
+    # Create main app with routes and MCP's lifespan
     app = Starlette(
         routes=[
             Route("/health", health_check, methods=["GET"]),
             Route("/refresh", refresh_stations, methods=["POST"]),
             Mount("/", app=mcp_app),
         ],
+        lifespan=mcp_app.lifespan,
     )
+
+    # Start station data loading in background after server starts
+    @app.on_event("startup")
+    async def startup_event():
+        asyncio.create_task(load_station_data_async())
+
+    async def load_station_data_async():
+        print("Loading station data from MTA in background...")
+        try:
+            await station_data.load()
+            print(f"Loaded {len(station_data.subway.stations)} subway stations")
+            print(f"Loaded {len(station_data.lirr.stations)} LIRR stations")
+            print(
+                f"Loaded {len(station_data.metro_north.stations)} Metro-North stations"
+            )
+        except Exception as e:
+            print(f"Warning: Failed to load station data: {e}")
 
     uvicorn.run(app, host=host, port=port)
